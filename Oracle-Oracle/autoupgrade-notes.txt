@@ -1,0 +1,221 @@
+#### Source Database/Server
+# We can execute steps below till ... "-mode analyze" on the prod databases to check what will need to be done on those database and prepare for it (Not possible for 11.1.0.7)
+
+export ORACLE_SID=orcl11
+export ORAENV_ASK=NO
+. oraenv
+export ORAENV_ASK=YES
+
+
+# mkdir -p /export/home/oracle/software/autoupgrade
+# copy autoupgrade.jar to /export/home/oracle/software/autoupgrade/
+
+sqlplus / as sysdba <<EOF
+    startup
+    exit
+EOF
+
+
+# create config file for source database autoupgrade run. (/export/home/oracle/software/autoupgrade/source-config.txt)
+echo "global.autoupg_log_dir=/export/home/oracle/software/autoupgrade/logs
+#
+# Database number 1
+#
+upg1.dbname=orcl11
+upg1.start_time=NOW
+upg1.source_home=/u01/app/oracle/product/11.2.0.4/dbhome_1
+upg1.target_home=/u01/app/oracle/product/19.0.0/dbhome_1
+upg1.sid=orcl11
+upg1.log_dir=/export/home/oracle/software/autoupgrade/logs
+upg1.upgrade_node=localhost
+upg1.target_version=19
+upg1.restoration=no" > /export/home/oracle/software/autoupgrade/source-config.txt
+
+
+# create config file for target database autoupgrade run. (/export/home/oracle/software/autoupgrade/target-config.txt)
+echo "global.autoupg_log_dir=/export/home/oracle/software/autoupgrade/logs
+#
+# Database number 2
+#
+upg1.dbname=orcl11
+upg1.start_time=NOW
+upg1.source_home=/tmp
+upg1.target_home=/u01/app/oracle/product/19.0.0/dbhome_1
+upg1.sid=orcl11
+upg1.log_dir=/export/home/oracle/software/autoupgrade/logs
+upg1.upgrade_node=localhost
+upg1.target_version=19
+upg1.restoration=no
+#upg1.target_cdb=cdb1
+#upg1.target_pdb_name=pdb1 > /export/home/oracle/software/autoupgrade/target-config.txt
+
+
+# Analyze stage
+java -jar autoupgrade.jar -config /export/home/oracle/software/autoupgrade/source-config.txt -mode analyze
+
+status_log_lines=$(cat /export/home/oracle/software/autoupgrade/logs/cfgtoollogs/upgrade/auto/status/status.log | wc -l)
+if [ $status_log_lines > 80 ]; then 
+   cat /export/home/oracle/software/autoupgrade/logs/cfgtoollogs/upgrade/auto/status/status.log | more
+else
+   cat /export/home/oracle/software/autoupgrade/logs/cfgtoollogs/upgrade/auto/status/status.log
+fi
+
+# Fixup stage
+
+java -jar autoupgrade.jar -config /export/home/oracle/software/autoupgrade/source-config.txt -mode fixups
+
+
+status_log_lines=$(cat /export/home/oracle/software/autoupgrade/logs/orcl11/101/prechecks/orcl11_preupgrade.log | wc -l)
+if [ $status_log_lines > 80 ]; then 
+   cat /export/home/oracle/software/autoupgrade/logs/orcl11/101/prechecks/orcl11_preupgrade.log | more
+else
+   cat /export/home/oracle/software/autoupgrade/logs/orcl11/101/prechecks/orcl11_preupgrade.log
+fi
+
+ 
+# Remove OLAP 
+$ORACLE_HOME/olap/admin/catnoamd.sql
+
+# Remove EM repos (**NOTE** Will need to scp when the source and target servers are seperate machines)
+if [ ! -f /tmp/em_remove ]; then 
+    emctl_present=$(which emctl)
+    if [ $? = 0 ]; then
+       cp $oh19/rdbms/admin/emremove.sql $oh11204/rdbms/admin/
+       cd $oh11204/rdbms/admin/
+       emctl stop dbconsole
+
+       sqlplus / as sysdba <<EOF
+           SET ECHO ON;
+           SET SERVEROUTPUT ON;
+           @emremove.sql
+           exit
+       EOF
+
+       touch /tmp/em_remove
+    fi 
+fi 
+
+
+# Upgrade APEX manually after the database upgrade if its being used. Look up note 1344948.1 on Oracle Support Website.
+
+# Remove expired AWR snapshots to reduce upgrade time
+
+# Gather stale data dict statistics
+sqlplus / as sysdba <<EOF
+   PURGE DBA_RECYCLEBIN
+   EXECUTE DBMS_STATS.GATHER_DICTIONARY_STATS;
+   
+   %ORACLE_HOME%/rdbms/admin/catnoexf.sql
+   
+   exit
+EOF
+
+#  The database is using time zone file version 4 and the target 19 release ships with time zone file version 32. refer to "Upgrading the Time Zone File and Timestamp with Time Zone Data" in the 19 Oracle Database Globalization Support Guide
+#  Recompile the objects with timestamp mismatch. Please refer to MOS note 781959.1 for more details
+
+
+
+
+
+
+# Backup database on source and restore on target 
+# Method 1 (if no archive logs): On target server: Create folder structure similar to source. On Source server: Shutdown source DB and copy data files, redo logs, control files, spfile, pfile, password file
+
+export ORACLE_SID=orcl11
+export ORAENV_ASK=NO
+. oraenv
+export ORAENV_ASK=YES
+
+rman target / <<EOF
+backup incremental level 0 format '/u01/backups/orcl11/BKP_TS_LEV0_%U' tablespace USERS;
+# backup incremental level 0 format '/u01/backups/orcl11/BKP_TS_LEV0_%U' database;
+EOF
+
+cp /u01/backups/orcl11/* /u01/backups/orcl11/pdb1/
+cp /u01/backups/orcl11/* /u01/flash_recovery_area/CDB1/
+
+export ORACLE_SID=cdb1
+export ORAENV_ASK=NO
+. oraenv
+export ORAENV_ASK=YES
+export ORACLE_SID=pdb1
+
+
+
+
+# Make sure tns entries are present
+
+CDB1 =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = orazoracol01)(PORT = 1521))
+    (CONNECT_DATA =
+      (SERVER = DEDICATED)
+      (SERVICE_NAME = cdb1)
+    )
+  )
+
+PDB1 =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = orazoracol01)(PORT = 1521))
+    (CONNECT_DATA =
+      (SERVICE_NAME = pdb1)
+      (SERVER = DEDICATED)
+    )
+   )
+
+
+
+
+rman target sys/sys@pdb1 <<EOF
+restore database tablespace USERS;
+# format '/u01/backups/cdb1/BKP_TS_LEV0_%U'
+EOF
+
+# Method 2 (with archive logs): 
+	On source server: backup  incremental level 0 format '/u03/oracle/backup/BKP_TS_LEV0_%U' tablespace users1, users2, data;
+	scp the files to target server
+	rman target sys/passwd@pdb3, restore from platform 'Microsoft Windows x86 64-bit' foreign datafile 7 format '/u01/app/oracle/oradata/condb1/pdb3/tts_data01.dbf' from backupset format '/u03/oracle/backup/BKP_TS_LEV0_%U' ; 
+# restore from platform 'Microsoft Windows x86 64-bit' foreign datafile 7 format '/u01/app/oracle/oradata/condb1/pdb3/tts_data01.dbf' from backupset '/home/oracle/BKP_TS_LEV0_04PDVJFU_1_1';
+	Note the datafiles have been restored in the required location : ls -l {file_dest}
+
+	backup  incremental level 1 format '/u03/oracle/backup/BKP_TS_LEV1_%U' tablespace users1, users2, data;
+	scp the files to target server
+	rman target sys/passwd@pdb3, recover from platform 'Microsoft Windows x86 64-bit' datafilecopy  '/u01/app/oracle/oradata/condb1/pdb3/tts_data01.dbf' from backupset format '/u03/oracle/backup/BKP_TS_LEV0_%U' ; 
+
+# recover from platform 'Microsoft Windows x86 64-bit' foreign datafilecopy  '/u01/app/oracle/oradata/condb1/pdb3/tts_ind01.dbf' from backupset '/home/oracle/BKP_TS_LEV1_05PDVK3E_1_1';
+
+# On the source 11g Windows database we will make the tablespace read only. From this point onwards we will have a brief outage just to take a final incremental backup and a data pump export of the tablespace metadata. 
+
+alter tablespace tts_data read only;
+alter tablespace tts_ind read only;
+	backup  incremental level 1 format '/u03/oracle/backup/BKP_TS_LEV1_%U' tablespace users1, users2, data;
+	expdp directory=data_pump_dir dumpfile=tts_exp.dmp logfile=tts_exp.log transport_tablespaces=tts_data,tts_ind
+alter tablespace tts_data read write;
+alter tablespace tts_ind read write;
+# Copy the data pump export dump file and the final RMAN incremental backupset piece from source to target server and perform a recovery.
+	rman target sys/passwd@pdb3, recover from platform 'Microsoft Windows x86 64-bit' datafilecopy  '/u01/app/oracle/oradata/condb1/pdb3/tts_data01.dbf' from backupset format '/u03/oracle/backup/BKP_TS_LEV0_%U' ; 
+
+# Lastly perform a data pump import of the tablespace metadata and make the tablespaces read write
+impdp '"sys@pdb3 as sysdba"' directory=mytest dumpfile=TTS_EXP.DMP transport_datafiles='/u01/app/oracle/oradata/condb1/pdb3/tts_data01.dbf','/u01/app/oracle/oradata/condb1/pdb3/tts_ind01.dbf'
+alter session set container=pdb3;
+alter tablespace tts_data read write;
+alter tablespace tts_ind  read write;
+
+
+
+# Verify all data from source in present on target
+
+
+
+
+
+
+
+# Gather dictionary and fixed objects stats in the new database
+sqlplus / as sysdba <<EOF
+   PURGE DBA_RECYCLEBIN
+   EXECUTE DBMS_STATS.GATHER_DICTIONARY_STATS; 
+   EXECUTE DBMS_STATS.GATHER_FIXED_OBJECTS_STATS;
+   @%ORACLE_HOME%/rdbms/admin/utlrp.sql
+   exit
+EOF

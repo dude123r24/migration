@@ -1,0 +1,1 @@
+REPLACE_COLS {OBJECT_NAME1_HERE}(column name 1:column_name1,column name 2:column_name_2) {OBJECT_NAME2_HERE}(column name 1:column_name1)
